@@ -1,0 +1,6 @@
+fastapi
+uvicorn[standard]
+pydantic
+PyQt6
+requests
+bcrypt
