@@ -1,4 +1,6 @@
+import sqlite3
 from datetime import datetime, timezone
+from typing import Optional
 
 from fastapi import Depends, FastAPI, HTTPException
 
@@ -8,6 +10,10 @@ from .models import (
     AdminPasswordReset,
     BootstrapStatus,
     ChangePasswordRequest,
+    EmployeeAuditLogEntry,
+    EmployeeCreate,
+    EmployeeOut,
+    EmployeeUpdate,
     LoanInput,
     LoanResult,
     LoginRequest,
@@ -176,3 +182,125 @@ def delete_user(user_id: int, _admin: dict = Depends(auth.require_admin)):
     auth.invalidate_sessions_for_user(user_id)
     database.delete_user(user_id)
     return {"ok": True}
+
+
+# ---- Employee Records (admin-only for now — see auth.require_employee_records_access) ----
+# NOTE: /employees/recycle-bin and /employees/audit-log must stay declared before
+# /employees/{employee_id} — FastAPI matches routes in declaration order, and
+# employee_id:int would otherwise fail to parse those path segments first.
+
+@app.post("/employees", response_model=EmployeeOut)
+def create_employee(payload: EmployeeCreate, admin: dict = Depends(auth.require_employee_records_access)):
+    if payload.employee_code and database.get_employee_by_code(payload.employee_code) is not None:
+        raise HTTPException(status_code=409, detail="Employee code already exists")
+    now = datetime.now(timezone.utc).isoformat()
+    try:
+        record = database.create_employee(
+            fields=payload.model_dump(),
+            created_by=admin["user_id"],
+            performed_by_username=admin["username"],
+            created_at=now,
+        )
+    except sqlite3.IntegrityError:
+        raise HTTPException(status_code=409, detail="Employee code already exists")
+    return EmployeeOut(**record)
+
+
+@app.get("/employees", response_model=list[EmployeeOut])
+def list_employees(
+    search: Optional[str] = None,
+    status: Optional[str] = None,
+    _admin: dict = Depends(auth.require_employee_records_access),
+):
+    return database.list_employees(search=search, status=status)
+
+
+@app.get("/employees/recycle-bin", response_model=list[EmployeeOut])
+def list_employee_recycle_bin(_admin: dict = Depends(auth.require_employee_records_access)):
+    return database.list_deleted_employees()
+
+
+@app.get("/employees/audit-log", response_model=list[EmployeeAuditLogEntry])
+def get_global_employee_audit_log(
+    limit: int = 100, _admin: dict = Depends(auth.require_employee_records_access)
+):
+    return database.list_all_employee_audit_log(limit=limit)
+
+
+@app.get("/employees/{employee_id}", response_model=EmployeeOut)
+def get_employee(employee_id: int, _admin: dict = Depends(auth.require_employee_records_access)):
+    record = database.get_employee(employee_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail="Employee not found")
+    return record
+
+
+@app.patch("/employees/{employee_id}", response_model=EmployeeOut)
+def update_employee(
+    employee_id: int, payload: EmployeeUpdate, admin: dict = Depends(auth.require_employee_records_access)
+):
+    existing = database.get_employee(employee_id)
+    if existing is None:
+        raise HTTPException(status_code=404, detail="Employee not found")
+    if existing["deleted_at"] is not None:
+        raise HTTPException(status_code=400, detail="Employee is in the recycle bin — restore it before editing")
+
+    changes = payload.model_dump(exclude_unset=True)
+    new_code = changes.get("employee_code")
+    if new_code and new_code != existing["employee_code"]:
+        conflict = database.get_employee_by_code(new_code)
+        if conflict is not None and conflict["id"] != employee_id:
+            raise HTTPException(status_code=409, detail="Employee code already exists")
+
+    now = datetime.now(timezone.utc).isoformat()
+    try:
+        record = database.update_employee(employee_id, changes, admin["username"], now)
+    except sqlite3.IntegrityError:
+        raise HTTPException(status_code=409, detail="Employee code already exists")
+    return EmployeeOut(**record)
+
+
+@app.delete("/employees/{employee_id}")
+def delete_employee(employee_id: int, admin: dict = Depends(auth.require_employee_records_access)):
+    existing = database.get_employee(employee_id)
+    if existing is None:
+        raise HTTPException(status_code=404, detail="Employee not found")
+    if existing["deleted_at"] is not None:
+        raise HTTPException(status_code=400, detail="Employee is already in the recycle bin")
+    now = datetime.now(timezone.utc).isoformat()
+    database.soft_delete_employee(employee_id, admin["username"], now)
+    return {"ok": True}
+
+
+@app.post("/employees/{employee_id}/restore", response_model=EmployeeOut)
+def restore_employee(employee_id: int, admin: dict = Depends(auth.require_employee_records_access)):
+    existing = database.get_employee(employee_id)
+    if existing is None:
+        raise HTTPException(status_code=404, detail="Employee not found")
+    if existing["deleted_at"] is None:
+        raise HTTPException(status_code=400, detail="Employee is not in the recycle bin")
+    now = datetime.now(timezone.utc).isoformat()
+    database.restore_employee(employee_id, admin["username"], now)
+    return database.get_employee(employee_id)
+
+
+@app.delete("/employees/{employee_id}/permanent")
+def permanently_delete_employee(employee_id: int, admin: dict = Depends(auth.require_employee_records_access)):
+    existing = database.get_employee(employee_id)
+    if existing is None:
+        raise HTTPException(status_code=404, detail="Employee not found")
+    if existing["deleted_at"] is None:
+        raise HTTPException(
+            status_code=400, detail="Employee must be in the recycle bin before it can be permanently deleted"
+        )
+    now = datetime.now(timezone.utc).isoformat()
+    database.permanently_delete_employee(employee_id, admin["username"], now)
+    return {"ok": True}
+
+
+@app.get("/employees/{employee_id}/audit-log", response_model=list[EmployeeAuditLogEntry])
+def get_employee_audit_log(employee_id: int, _admin: dict = Depends(auth.require_employee_records_access)):
+    existing = database.get_employee(employee_id)
+    if existing is None:
+        raise HTTPException(status_code=404, detail="Employee not found")
+    return database.get_employee_audit_log(employee_id)
